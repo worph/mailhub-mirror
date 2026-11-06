@@ -220,11 +220,33 @@ class Worker(threading.Thread):
             changes = (f"{int(m.group(1)):,} new, {int(m.group(2)):,} changed, {int(m.group(3)):,} removed" if m else "up to date")
             write_status(slug, ok=True, running=False, messages=n, seconds=round(time.time() - started),
                          last=f"{n:,} messages here; this sync: {changes}")
+            if first or (m and int(m.group(1)) > 0):
+                threading.Thread(target=warm_index, args=(a,), daemon=True).start()
         else:
             err = next((l for l in reversed(out) if l.strip()), f"mbsync exit {r.returncode}")
             write_status(slug, ok=False, running=False, messages=n, last=err[:300])
             log(slug, "sync failed:", err)
         refresh_views()
+
+
+def warm_index(a):
+    """Have Dovecot full-text index the account's new mail now. mbsync writes Maildir
+    files directly, so nothing is indexed on arrival; without this the first search
+    in a big new mailbox would index it all while the user waits (and other searches
+    answer INUSE meanwhile). A search triggers the indexing (fts_search_add_missing)
+    and the indexer goes on with it after the search gives up."""
+    if not PASSWORD:
+        return
+    try:
+        m = imaplib.IMAP4(IMAP_HOST, IMAP_PORT)
+        m.login(USER, PASSWORD)
+        for f in live_folders(a["email"]):
+            if m.select(q(prefix_of(a) + f), readonly=True)[0] == "OK":
+                m.search(None, "BODY", '"mailhub-index-warm-up"')  # NO [INUSE] is fine
+        m.logout()
+        log(a["slug"], "full-text indexing started")
+    except Exception as e:
+        log(a["slug"], "full-text warm-up:", repr(e))
 
 
 # ------------------------------------------------------------------ views ---
