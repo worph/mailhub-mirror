@@ -191,13 +191,20 @@ class Worker(threading.Thread):
     def sync_once(self):
         a, slug = self.a, self.a["slug"]
         started, done = time.time(), threading.Event()
-        first = count_local(a["email"]) == 0
+        # first download until mbsync has completed a run of the INBOX (its state file)
+        first = not os.path.exists(f"{LIVE}/{a['email']}/INBOX/.mbsyncstate")
 
         def progress():
+            tick = 0
             while not done.wait(15):
                 n = count_local(a["email"])
-                write_status(slug, ok=True, running=True, messages=n,
-                             last=(f"first download running, {n:,} messages so far" if first else f"syncing, {n:,} messages"))
+                write_status(slug, ok=True, running=True, messages=n, first=first,
+                             last=(f"first download, {n:,} messages so far" if first else f"{n:,} messages here"))
+                # Folders appear while a (long, first) sync runs: list them in the
+                # views and subscribe them now, not only once the sync is over.
+                if tick % 4 == 0:
+                    refresh_views()
+                tick += 1
         threading.Thread(target=progress, daemon=True).start()
         try:
             r = run_mbsync(a, worker=self)
