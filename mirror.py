@@ -14,12 +14,13 @@ For each account file the Mail accounts page writes (/accounts/<slug>.json):
            message is tied to its provider UID by mbsync's own pairing (",U=<n>" in the
            file name + the folder's .mbsyncstate); an action on a message mbsync has
            not paired yet waits in pending.jsonl, in order per folder.
-  views    Merged/All inboxes, Unread and Flagged (Dovecot virtual folders) are
-           rewritten from the accounts and folders that exist, leaving out the
+  views    Merged/All inboxes, Unread, Flagged, Trash and Junk (Dovecot virtual
+           folders) are rewritten from the accounts and folders that exist, leaving out the
            accounts set to stay out of them ("in_views": false in the account file),
            and new Live/ and Merged/ folders are subscribed (the webmail lists
            subscribed folders). Before 0.4.1 the views were under Virtual/: those
-           subscriptions are dropped.
+           subscriptions are dropped. All inboxes, Trash and Junk include the local
+           INBOX, Trash and Junk and save into them (what is moved to the view).
   status   /state/status/<slug>.json for the Mail accounts page, with the download
            progress while a sync runs.
 
@@ -51,6 +52,9 @@ MAILDIR_FLAG = {"D": "\\Draft", "F": "\\Flagged", "R": "\\Answered", "S": "\\See
 # left out of the Unread and Flagged views (compared case-insensitively, last path part)
 NOT_IN_VIEWS = {"trash", "deleted items", "deleted messages", "bin", "junk", "spam", "bulk mail",
                 "drafts", "sent", "sent items", "sent messages", "sent mail", "all mail", "important", "starred"}
+# an account's Trash and Junk, by the folder's last path part (Gmail: [Gmail]/Trash, [Gmail]/Spam)
+TRASH_NAMES = {"trash", "deleted items", "deleted messages", "bin"}
+JUNK_NAMES = {"junk", "spam", "bulk mail"}
 # Gmail's label views would download every message again
 GMAIL_SKIP = ["[Gmail]/All Mail", "[Gmail]/Important", "[Gmail]/Starred", "[Google Mail]/All Mail",
               "[Google Mail]/Important", "[Google Mail]/Starred"]
@@ -272,7 +276,10 @@ VIEWS_LOCK = threading.Lock()
 def refresh_views():
     with VIEWS_LOCK:
         accs = load_accounts()
-        inboxes, rest, with_sent = ["INBOX"], ["INBOX"], ["INBOX"]
+        # "!" marks where a message moved into the view is saved (the local folder):
+        # Roundcube's Trash and Junk are Merged/Trash and Merged/Junk.
+        inboxes, rest, with_sent = ["!INBOX"], ["INBOX"], ["INBOX"]
+        trash, junk = ["!Trash"], ["!Junk"]
         for a in accs.values():
             if a.get("in_views") is False:
                 continue
@@ -282,11 +289,16 @@ def refresh_views():
                 base = f.split("/")[-1].lower()
                 if f == "INBOX":
                     inboxes.append(name)
+                if base in TRASH_NAMES:
+                    trash.append(name)
+                if base in JUNK_NAMES:
+                    junk.append(name)
                 if base not in NOT_IN_VIEWS:
                     rest.append(name)
                 if base not in NOT_IN_VIEWS or base in ("sent", "sent items", "sent messages", "sent mail"):
                     with_sent.append(name)
-        views = {"All inboxes": (inboxes, "all"), "Unread": (rest, "unseen"), "Flagged": (with_sent, "flagged")}
+        views = {"All inboxes": (inboxes, "all"), "Unread": (rest, "unseen"), "Flagged": (with_sent, "flagged"),
+                 "Trash": (trash, "all"), "Junk": (junk, "all")}
         makedirs(VIRTUAL, 0o700)
         for view, (boxes, rule) in views.items():
             d = f"{VIRTUAL}/{view}"

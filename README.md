@@ -19,9 +19,11 @@ For each account file (`/accounts/<slug>.json`):
 - **replay**: the IMAP actions done on `Live/` folders (recorded by the store's Dovecot Lua hook in
   `live-queue/events.jsonl`) become the same command at that provider: flags, append, expunge of that one UID,
   create / rename, delete only if empty there. Nothing is inferred.
-- **views**: `Merged/All inboxes`, `Unread` and `Flagged` (Dovecot virtual folders) rewritten from the
+- **views**: `Merged/All inboxes`, `Unread`, `Flagged`, `Trash` and `Junk` (Dovecot virtual folders) rewritten from the
   accounts and folders that exist, minus accounts with `"in_views": false`; new `Live/` and `Merged/` folders
-  subscribed. (Named `Virtual/` before 0.4.1: those subscriptions are dropped.)
+  subscribed. (Named `Virtual/` before 0.4.1: those subscriptions are dropped.) `All inboxes`, `Trash` and `Junk` also cover the local
+  `INBOX`, `Trash` and `Junk`, and save there what is moved into the view (the `!` line), so the webmail can
+  use `Merged/Trash` and `Merged/Junk` as its Trash and Junk.
 - **status**: `/state/status/<slug>.json` for the Mail accounts page, with the download progress.
 
 An account file removed stops its worker and deletes this server's copy (never the provider's).
