@@ -14,9 +14,12 @@ For each account file the Mail accounts page writes (/accounts/<slug>.json):
            message is tied to its provider UID by mbsync's own pairing (",U=<n>" in the
            file name + the folder's .mbsyncstate); an action on a message mbsync has
            not paired yet waits in pending.jsonl, in order per folder.
-  views    Virtual/All inboxes, Unread and Flagged (Dovecot virtual folders) are
-           rewritten from the accounts and folders that exist, and new Live/ and
-           Virtual/ folders are subscribed (the webmail lists subscribed folders).
+  views    Merged/All inboxes, Unread and Flagged (Dovecot virtual folders) are
+           rewritten from the accounts and folders that exist, leaving out the
+           accounts set to stay out of them ("in_views": false in the account file),
+           and new Live/ and Merged/ folders are subscribed (the webmail lists
+           subscribed folders). Before 0.4.1 the views were under Virtual/: those
+           subscriptions are dropped.
   status   /state/status/<slug>.json for the Mail accounts page, with the download
            progress while a sync runs.
 
@@ -271,6 +274,8 @@ def refresh_views():
         accs = load_accounts()
         inboxes, rest, with_sent = ["INBOX"], ["INBOX"], ["INBOX"]
         for a in accs.values():
+            if a.get("in_views") is False:
+                continue
             folders = live_folders(a["email"])
             for f in folders:
                 name = prefix_of(a) + f
@@ -303,7 +308,7 @@ def subscribe_all():
         m = imaplib.IMAP4(IMAP_HOST, IMAP_PORT)
         m.login(USER, PASSWORD)
         names = set()
-        for pat in ("Live/*", "Virtual/*"):
+        for pat in ("Live/*", "Merged/*"):
             for line in m.list('""', pat)[1] or []:
                 if line and b"\\Noselect" not in line:
                     names.add(line.decode().rsplit(' "/" ', 1)[-1].strip('"'))
@@ -311,6 +316,9 @@ def subscribe_all():
         for n in sorted(names - subscribed):
             m.subscribe(q(n))
             log("subscribed", n)
+        for n in sorted(n for n in subscribed if n.startswith("Virtual/")):  # the views' name before 0.4.1
+            m.unsubscribe(q(n))
+            log("unsubscribed", n)
         m.logout()
     except Exception as e:
         log("subscribe failed:", repr(e))
@@ -577,7 +585,7 @@ def main():
     workers = {}
     threading.Thread(target=replay_loop, args=(workers,), daemon=True).start()
     refresh_views()
-    seen, nudge = None, 0
+    seen, seen_views, nudge = None, None, 0
     while True:
         accs = load_accounts()
         sig = {s: (a["email"], a["imap_host"], a["imap_port"], a["user"], a["pass"], a.get("imap_security")) for s, a in accs.items()}
@@ -600,6 +608,11 @@ def main():
                     log("mirroring", a["email"])
             seen = sig
             refresh_views()
+        in_views = {s: a.get("in_views") is not False for s, a in accs.items()}
+        if in_views != seen_views:  # only the views change: no worker restarts
+            if seen_views is not None:
+                refresh_views()
+            seen_views = in_views
         try:
             t = os.path.getmtime(f"{ACCOUNTS}/.sync-now")  # touched by the page on save
         except OSError:
