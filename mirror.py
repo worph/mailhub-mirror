@@ -14,13 +14,15 @@ For each account file the Mail accounts page writes (/accounts/<slug>.json):
            message is tied to its provider UID by mbsync's own pairing (",U=<n>" in the
            file name + the folder's .mbsyncstate); an action on a message mbsync has
            not paired yet waits in pending.jsonl, in order per folder.
-  views    Merged/All inboxes, Unread, Flagged, Trash and Junk (Dovecot virtual
+  views    Merged/All inboxes, Unread, Flagged, Trash, Junk and Archive (Dovecot virtual
            folders) are rewritten from the accounts and folders that exist, leaving out the
            accounts set to stay out of them ("in_views": false in the account file),
            and new Live/ and Merged/ folders are subscribed (the webmail lists
            subscribed folders). Before 0.4.1 the views were under Virtual/: those
-           subscriptions are dropped. All inboxes, Trash and Junk include the local
-           INBOX, Trash and Junk and save into them (what is moved to the view).
+           subscriptions are dropped. All inboxes, Trash, Junk and Archive include the
+           local INBOX, Trash, Junk and Archive and save into them (what is moved to the
+           view). Archive covers each account's Archive (or Archives) folder and its
+           subfolders, which are left out of Unread (archived = out of the way).
   status   /state/status/<slug>.json for the Mail accounts page, with the download
            progress while a sync runs.
 
@@ -55,6 +57,8 @@ NOT_IN_VIEWS = {"trash", "deleted items", "deleted messages", "bin", "junk", "sp
 # an account's Trash and Junk, by the folder's last path part (Gmail: [Gmail]/Trash, [Gmail]/Spam)
 TRASH_NAMES = {"trash", "deleted items", "deleted messages", "bin"}
 JUNK_NAMES = {"junk", "spam", "bulk mail"}
+# an account's archive, by the folder's first path part (Archive/2024 included)
+ARCHIVE_NAMES = {"archive", "archives"}
 # Gmail's label views would download every message again
 GMAIL_SKIP = ["[Gmail]/All Mail", "[Gmail]/Important", "[Gmail]/Starred", "[Google Mail]/All Mail",
               "[Google Mail]/Important", "[Google Mail]/Starred"]
@@ -279,7 +283,7 @@ def refresh_views():
         # "!" marks where a message moved into the view is saved (the local folder):
         # Roundcube's Trash and Junk are Merged/Trash and Merged/Junk.
         inboxes, rest, with_sent = ["!INBOX"], ["INBOX"], ["INBOX"]
-        trash, junk = ["!Trash"], ["!Junk"]
+        trash, junk, archive = ["!Trash"], ["!Junk"], ["!Archive"]
         for a in accs.values():
             if a.get("in_views") is False:
                 continue
@@ -293,12 +297,15 @@ def refresh_views():
                     trash.append(name)
                 if base in JUNK_NAMES:
                     junk.append(name)
-                if base not in NOT_IN_VIEWS:
+                archived = f.split("/")[0].lower() in ARCHIVE_NAMES
+                if archived:
+                    archive.append(name)
+                if base not in NOT_IN_VIEWS and not archived:
                     rest.append(name)
                 if base not in NOT_IN_VIEWS or base in ("sent", "sent items", "sent messages", "sent mail"):
                     with_sent.append(name)
         views = {"All inboxes": (inboxes, "all"), "Unread": (rest, "unseen"), "Flagged": (with_sent, "flagged"),
-                 "Trash": (trash, "all"), "Junk": (junk, "all")}
+                 "Trash": (trash, "all"), "Junk": (junk, "all"), "Archive": (archive, "all")}
         makedirs(VIRTUAL, 0o700)
         for view, (boxes, rule) in views.items():
             d = f"{VIRTUAL}/{view}"
@@ -319,6 +326,10 @@ def subscribe_all():
     try:
         m = imaplib.IMAP4(IMAP_HOST, IMAP_PORT)
         m.login(USER, PASSWORD)
+        # Merged/Archive saves what is moved into it in the local Archive, which the
+        # stock config does not create (it does Trash and Junk)
+        if not (m.list('""', "Archive")[1] or [None])[0]:
+            log("create local Archive:", m.create("Archive")[0])
         names = set()
         for pat in ("Live/*", "Merged/*"):
             for line in m.list('""', pat)[1] or []:
@@ -506,6 +517,7 @@ def apply(ev, accs, remotes, workers):
 
     if kind == "MailboxCreate":
         typ, d = r.get().create(q(box))
+        refresh_views()  # a new Archive belongs in Merged/Archive now, not at the next pull
         return f"CREATE {box}: {typ}"
     if kind == "MailboxRename":
         old = ev.get("mailbox_old", "")
