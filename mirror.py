@@ -390,6 +390,12 @@ def local_file(a, box, uid):
 
 
 SNAP = {}  # (email, box, dovecot uid) -> mbsync near uid, so an expunge can be resolved
+# uidlist path -> (inode, mtime_ns, size) when last read. The replay loop calls
+# snapshot() every 2 s; re-parsing every folder's uidlist each time (tens of
+# thousands of lines on a few big accounts) kept a core a quarter busy, while
+# a uidlist only changes when mail arrives, moves or is expunged.
+SNAP_SEEN = {}
+NEAR_UID = re.compile(r",U=(\d+)")
 
 
 def snapshot(accs):
@@ -399,16 +405,22 @@ def snapshot(accs):
             if "dovecot-uidlist" not in filenames:
                 continue
             box = os.path.relpath(dirpath, root)
+            path = os.path.join(dirpath, "dovecot-uidlist")
             try:
-                with open(os.path.join(dirpath, "dovecot-uidlist")) as f:
+                with open(path) as f:
+                    st = os.fstat(f.fileno())
+                    sig = (st.st_ino, st.st_mtime_ns, st.st_size)
+                    if SNAP_SEEN.get(path) == sig:
+                        continue  # unchanged: its pairs are already in SNAP
                     for line in f:
                         p = line.rstrip("\n").split(" ", 1)
                         if len(p) > 1 and p[0].isdigit():
-                            m = re.search(r",U=(\d+)", p[1])
+                            m = NEAR_UID.search(p[1])
                             if m:
                                 SNAP[(a["email"], box, int(p[0]))] = int(m.group(1))
+                    SNAP_SEEN[path] = sig
             except FileNotFoundError:
-                pass
+                SNAP_SEEN.pop(path, None)
 
 
 class Remote:
