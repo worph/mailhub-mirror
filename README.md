@@ -11,7 +11,9 @@ where this image was built up to 0.4.1 (history kept here).
 
 ## What it does
 
-For each account file (`/accounts/<slug>.json`):
+One mailbox per MailHub user: the owner, `admin`, plus every user in the registry the webmail keeps
+(`/users/<name>.json`, one per signed-in identity; mailhub-roundcube's `mailhub_sso`). For each account
+file a user's page writes (`/accounts/<user>/<slug>.json`):
 
 - **pull**: mbsync, pull only, into `Live/<address>/` (Maildir). Never writes to the provider; folders are
   never removed. One worker per account, every `MAILHUB_SYNC_INTERVAL` seconds (120), or at once when the
@@ -27,12 +29,24 @@ For each account file (`/accounts/<slug>.json`):
   folder and its subfolders, plus the local `Archive` (created if missing); archived mail is left out of `Unread`.
   A folder created through Dovecot (the webmail archiving into an account that had no Archive) is added to the views
   as soon as its CREATE is replayed.
-- **status**: `/state/status/<slug>.json` for the Mail accounts page, with the download progress.
+- **status**: `/state/<user>/status/<slug>.json` for the Mail accounts page, with the download progress.
+- **users**: the device logins (IMAPS, CalDAV/CardDAV). `/srv/vmail/.mailhub-passwd`, the passwd-file the
+  store's Dovecot config checks, is rendered from the registry's `{SSHA512}` hashes plus the owner's
+  `MAILHUB_PASSWORD`; each registry user gets a Baïkal account (user, principal, one calendar, one address
+  book) with its digest, in Baïkal's SQLite (`/baikal/db/db.sqlite`); `/state/<user>/device-applied` says
+  which digest is in effect. The owner's Baïkal account is the store's `baikal-init` step's.
+
+Dovecot is reached as each user through its master login (SASL PLAIN, authzid = the user,
+`MAILHUB_MASTER_PASSWORD`). Before 0.5.0 there was one user and the files were `/accounts/<slug>.json` and
+`/state/{status,run}/`: moved under `admin/` at start. A user removed from the registry stops syncing; their
+mail stays on disk.
 
 An account file removed stops its worker and deletes this server's copy (never the provider's).
 
-Settings: `MAILHUB_USER` (`admin`), `MAILHUB_PASSWORD` (to subscribe folders), `MAILHUB_IMAP_HOST` / `_PORT`
-(`mailhub-imap:31143`), `MAILHUB_SYNC_INTERVAL`, `MAILHUB_VMAIL_UID` (1000). Runs as root to read the webmail's
+Settings: `MAILHUB_MASTER_PASSWORD` (Dovecot's master login), `MAILHUB_PASSWORD` (the owner's device
+login), `MAILHUB_IMAP_HOST` / `_PORT` (`mailhub-imap:31143`), `MAILHUB_SYNC_INTERVAL`, `MAILHUB_VMAIL_UID`
+(1000), `MAILHUB_WEB_UID` (33, the webmail's user, for the moved account folder), `MAILHUB_BAIKAL_DB`.
+Mounts: `/srv/vmail`, `/accounts` (read-write for the one-time move), `/state`, `/users` (ro), `/baikal`. Runs as root to read the webmail's
 private account files; mbsync runs as the mailbox owner. Details in `mirror.py`'s docstring.
 
 ## Building and releasing
