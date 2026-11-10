@@ -27,6 +27,20 @@ account file a user's Mail accounts page writes (/accounts/<user>/<slug>.json):
            subfolders, which are left out of Unread (archived = out of the way).
   status   /state/<user>/status/<slug>.json for the Mail accounts page, with the
            download progress while a sync runs.
+  idle     IMAP IDLE on each account's INBOX at the provider (MAILHUB_IDLE, on by
+           default): new mail there wakes the account's worker for an INBOX-only pull
+           at once. A server without IDLE keeps the polling.
+  push     Web Push to the devices a user turned on in the webmail (Settings →
+           Notifications, /accounts/<user>/.push.json): after each pull, the INBOX
+           messages above the account's high-water mark (/state/<user>/push-hwm.json,
+           the highest UID seen) still unread become a notification (sender + subject,
+           or only a count with show_content off; more than 3 at once: one summary).
+           The first download and the first sync with no mark only set the mark.
+           A test request (.push-test.json, {nonce, device}) is answered in
+           /state/<user>/push-status.json, with each device's last delivery or failure
+           (`gone` once the push service answers 404/410). The VAPID key is made once
+           in /state/.push/ (vapid.json private, vapid-public.txt for the webmail);
+           MAILHUB_PUSH_SUBJECT is its contact (the app's https URL).
 
   users    The device logins (IMAPS, CalDAV/CardDAV): /srv/vmail/.mailhub-passwd, the
            passwd-file Dovecot checks, rendered from the registry's hashes plus the
@@ -48,7 +62,9 @@ Before 0.5.0 there was one user and the files were /accounts/<slug>.json and
 Runs as root to read the webmail's private account files; mbsync runs as the
 mailbox's owner (MAILHUB_VMAIL_UID) and every file it creates belongs to it.
 """
-import base64, hashlib, imaplib, json, os, re, shutil, sqlite3, ssl, subprocess, threading, time
+import base64, email.parser, email.policy, hashlib, imaplib, json, os, re, select, shutil, sqlite3, ssl, subprocess, threading, time
+
+import webpush
 
 OWNER = "admin"
 OWNER_PASSWORD = os.environ.get("MAILHUB_PASSWORD", "")
@@ -58,6 +74,10 @@ IMAP_HOST = os.environ.get("MAILHUB_IMAP_HOST", "mailhub-imap")
 IMAP_PORT = int(os.environ.get("MAILHUB_IMAP_PORT", "31143"))
 INTERVAL = int(os.environ.get("MAILHUB_SYNC_INTERVAL", "120"))
 VMAIL = int(os.environ.get("MAILHUB_VMAIL_UID", "1000"))
+# Web Push: the VAPID subject (the app's https URL, or a mailto:) and IMAP IDLE on each INBOX
+PUSH_SUBJECT = os.environ.get("MAILHUB_PUSH_SUBJECT", "")
+IDLE_ON = os.environ.get("MAILHUB_IDLE", "1") != "0"
+IDLE_RENEW = 25 * 60  # RFC 2177: re-issue IDLE before the server's 29-minute cut
 WEB_UID = int(os.environ.get("MAILHUB_WEB_UID", "33"))  # the webmail's www-data
 ACCOUNTS = "/accounts"
 STATE = "/state"
@@ -66,6 +86,8 @@ VMAIL_ROOT = "/srv/vmail"
 PASSWD = f"{VMAIL_ROOT}/.mailhub-passwd"
 BAIKAL_DB = os.environ.get("MAILHUB_BAIKAL_DB", "/baikal/db/db.sqlite")
 BAIKAL_REALM = "BaikalDAV"
+PUSH_DIR = f"{STATE}/.push"  # vapid.json (private, 0600) + vapid-public.txt (the webmail reads it)
+VAPID = None  # webpush.Vapid, set in main()
 # a local user name: also a Dovecot home (/srv/vmail/<name>) and a Baïkal principal
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}")
 
@@ -258,6 +280,7 @@ class Mailbox:
         self.snap_seen = {}
         self.workers = {}
         self.seen, self.seen_views, self.nudge = None, None, 0
+        self.push = Push(self)
         self.stopped = False
 
     def log(self, *a):
@@ -467,6 +490,7 @@ class Mailbox:
             self.log("subscribe failed:", repr(e))
 
     def forget(self, slug, email):
+        self.push.forget(slug)
         """An account removed from the page: delete this server's copy (never the provider's)."""
         for d in (f"{self.live}/{email}", f"{self.live_index}/{email}", f"{self.live_control}/{email}"):
             if email and os.path.isdir(d) and os.path.realpath(d).startswith(self.home + "/live"):
@@ -722,6 +746,234 @@ class Mailbox:
                 for w in self.workers.values():
                     w.wake.set()
             self.nudge = t
+        self.push.check_test()
+
+
+# ------------------------------------------------------------------- push ---
+
+PUSH_TEXTS = {  # the webmail writes its user's language into .push.json; these are the fallback
+    "new_many": "{n} new messages",
+    "hidden_one": "New message on {account}",
+    "hidden_many": "{n} new messages on {account}",
+    "no_subject": "(no subject)",
+    "test_title": "MailHub",
+    "test_body": "Test notification: notifications work on this device.",
+}
+PUSH_SUMMARY_OVER = 3  # more new messages than this in one sync: one notification for them all
+HEADER_PARSER = email.parser.BytesHeaderParser(policy=email.policy.default)
+
+
+class Push:
+    """Web Push to one user's devices (the webmail's Settings → Notifications).
+
+    The webmail writes /accounts/<user>/.push.json (devices: endpoint + keys; show_content;
+    muted account slugs; texts in the user's language) and .push-test.json (a test request);
+    this writes /state/<user>/push-status.json (per device: last delivery, `gone` once the
+    push service says the subscription is no more; the test results by nonce) and
+    push-hwm.json (per account, the highest INBOX UID already considered)."""
+
+    def __init__(self, mb):
+        self.mb = mb
+        self.conf_file, self.test_file = f"{mb.accounts}/.push.json", f"{mb.accounts}/.push-test.json"
+        self.status_file, self.hwm_file = f"{mb.state}/push-status.json", f"{mb.state}/push-hwm.json"
+        self.lock = threading.Lock()
+        self.conf, self.conf_key = {}, None
+        self.test_seen = None
+
+    def read_json(self, path):
+        try:
+            with open(path) as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def write_json(self, path, data):
+        tmp = os.path.join(os.path.dirname(path), "." + os.path.basename(path) + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+
+    def config(self):
+        try:
+            st = os.stat(self.conf_file)
+            key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            key = None
+        if key != self.conf_key:
+            self.conf, self.conf_key = (self.read_json(self.conf_file) if key else {}), key
+        return self.conf
+
+    def text(self, name, **kw):
+        t = self.config().get("texts") or {}
+        s = t.get(name) if isinstance(t.get(name), str) else PUSH_TEXTS[name]
+        try:
+            return s.format(**kw)
+        except (KeyError, IndexError, ValueError):
+            return PUSH_TEXTS[name].format(**kw)
+
+    def muted(self, a):
+        m = self.config().get("muted")
+        if isinstance(m, list):
+            return a["slug"] in m
+        return a.get("in_views") is False  # never chosen: like the Merged views
+
+    def devices(self):
+        """The devices to send to: well-formed, and not reported gone since last (re)subscribed."""
+        gone = {i: d.get("gone") for i, d in (self.read_json(self.status_file).get("devices") or {}).items()}
+        out = []
+        for d in self.config().get("devices") or []:
+            if not isinstance(d, dict) or not all(isinstance(d.get(k), str) for k in ("id", "endpoint", "p256dh", "auth")):
+                continue
+            if gone.get(d["id"]) and gone[d["id"]] == d.get("updated", d.get("added")):
+                continue
+            out.append(d)
+        return out
+
+    def deliver(self, payload, devices, ttl=86400, urgency="normal"):
+        """Send to each device; record the outcome per device. Returns {id: result}."""
+        results = {}
+        for d in devices:
+            status, text = webpush.send(VAPID, d, payload, ttl=ttl, urgency=urgency)
+            ok = status in (200, 201, 202)
+            results[d["id"]] = {"ok": ok, "status": status, **({} if ok else {"error": text[:200]})}
+            if not ok:
+                self.mb.log("push to", d.get("label") or d["id"], "failed:", status, text[:120])
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with self.lock:
+            st = self.read_json(self.status_file)
+            devs = st.setdefault("devices", {})
+            for d in devices:
+                r, e = results[d["id"]], devs.setdefault(d["id"], {})
+                if r["ok"]:
+                    e.update(last_ok=now)
+                    e.pop("gone", None)
+                    e.pop("error", None)
+                else:
+                    e.update(last_error=now, error=f"{r['status']} {r.get('error', '')}".strip())
+                    if r["status"] in (404, 410):
+                        e["gone"] = d.get("updated", d.get("added")) or now
+            known = {d.get("id") for d in self.config().get("devices") or [] if isinstance(d, dict)}
+            st["devices"] = {i: e for i, e in devs.items() if i in known}
+            self.write_json(self.status_file, st)
+        return results
+
+    def check_test(self):
+        """A test request from the page (.push-test.json, {nonce, device}): answered once."""
+        try:
+            t = os.path.getmtime(self.test_file)
+        except OSError:
+            return
+        if t == self.test_seen:
+            return
+        self.test_seen = t
+        req = self.read_json(self.test_file)
+        nonce = req.get("nonce")
+        if not isinstance(nonce, str) or (self.read_json(self.status_file).get("test") or {}).get("nonce") == nonce:
+            return
+        devices = [d for d in self.devices() if req.get("device") in (None, "all", d["id"])]
+        threading.Thread(target=self.run_test, args=(nonce, devices), daemon=True).start()
+
+    def run_test(self, nonce, devices):
+        payload = {"title": self.text("test_title"), "body": self.text("test_body"), "tag": "mailhub-test",
+                   "url": "?_task=settings&_action=plugin.mailhub_push"}
+        results = self.deliver(payload, devices, ttl=120, urgency="high") if devices and VAPID else {}
+        with self.lock:
+            st = self.read_json(self.status_file)
+            st["test"] = {"nonce": nonce, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                          "results": results, **({} if VAPID else {"error": "no VAPID key"})}
+            self.write_json(self.status_file, st)
+        self.mb.log("test notification:", sum(r["ok"] for r in results.values()), "of", len(results), "delivered")
+
+    # ------------------------------------------------------------ new mail ---
+
+    def hwm(self):
+        return self.read_json(self.hwm_file)
+
+    def set_hwm(self, slug, uid):
+        with self.lock:
+            h = self.hwm()
+            h[slug] = uid
+            self.write_json(self.hwm_file, h)
+
+    def forget(self, slug):
+        with self.lock:
+            h = self.hwm()
+            if h.pop(slug, None) is not None:
+                self.write_json(self.hwm_file, h)
+
+    def new_mail(self, a, first):
+        """After a sync: the INBOX messages above the account's high-water mark, still
+        unread, become a notification. The first download and the first sync since
+        this existed only set the mark."""
+        inbox = f"{self.mb.live}/{a['email']}/INBOX"
+        found = []  # (uid, path, seen)
+        for sub in ("new", "cur"):
+            try:
+                names = os.listdir(f"{inbox}/{sub}")
+            except OSError:
+                continue
+            for fn in names:
+                m = NEAR_UID.search(fn)
+                if m:
+                    flags = fn.split(":2,", 1)[1] if ":2," in fn else ""
+                    found.append((int(m.group(1)), f"{inbox}/{sub}/{fn}", "S" in flags))
+        top = max((u for u, _, _ in found), default=0)
+        mark = self.hwm().get(a["slug"])
+        if first or not isinstance(mark, int) or top < mark:  # no mark yet, or the folder was rebuilt
+            if mark != top:
+                self.set_hwm(a["slug"], top)
+            return
+        new = sorted((f for f in found if f[0] > mark and not f[2]), key=lambda f: f[0])
+        if top != mark:
+            self.set_hwm(a["slug"], top)
+        if not new or self.muted(a) or VAPID is None:
+            return
+        devices = self.devices()
+        if devices:
+            threading.Thread(target=self.notify, args=(a, new, devices), daemon=True).start()
+
+    def notify(self, a, new, devices):
+        show = self.config().get("show_content") is not False
+        account = a["email"]
+        several_accounts = len(self.mb.workers) > 1
+        base = {"tag": f"mailhub-{a['slug']}", "account": account, "url": "?_task=mail"}
+        if not show:
+            n = len(new)
+            payloads = [dict(base, title="MailHub", body=(self.text("hidden_one", account=account) if n == 1
+                                                         else self.text("hidden_many", n=n, account=account)))]
+        else:
+            heads = [self.headers(p) for _, p, _ in new]
+            if len(heads) > PUSH_SUMMARY_OVER:
+                senders = []
+                for s, _ in heads:
+                    if s not in senders:
+                        senders.append(s)
+                body = ", ".join(senders[:4]) + ("…" if len(senders) > 4 else "")
+                payloads = [dict(base, title=self.text("new_many", n=len(heads)) + (f" · {account}" if several_accounts else ""),
+                                 body=body)]
+            else:
+                payloads = [dict(base, tag=f"mailhub-{a['slug']}-{uid}", title=s,
+                                 body=subj + (f"\n{account}" if several_accounts else ""))
+                            for (uid, _, _), (s, subj) in zip(new, heads)]
+        for p in payloads:
+            self.deliver(p, devices)
+        self.mb.log(a["email"], len(new), "new: notified", len(devices), "device(s)")
+
+    def headers(self, path):
+        """(sender, subject) of a Maildir message, decoded; the file's headers only."""
+        try:
+            with open(path, "rb") as f:
+                h = HEADER_PARSER.parse(f)
+            sender, subject = "", str(h.get("subject") or "").strip()
+            frm = h.get("from")
+            if frm is not None:
+                addrs = getattr(frm, "addresses", ())
+                sender = (addrs[0].display_name or addrs[0].addr_spec) if addrs else str(frm)
+            return (sender.strip()[:80] or "?", subject[:160] or self.text("no_subject"))
+        except Exception:
+            return ("?", self.text("no_subject"))
 
 
 def prefix_of(a):
@@ -734,14 +986,19 @@ class Worker(threading.Thread):
     def __init__(self, mb, a):
         super().__init__(daemon=True)
         self.mb, self.a, self.wake, self.stop, self.proc = mb, a, threading.Event(), False, None
+        # set by the IDLE watcher: the next run pulls the INBOX only (new mail is there)
+        self.inbox_only = False
 
     def run(self):
+        if IDLE_ON:
+            IdleWatcher(self).start()
         while not self.stop:
-            self.sync_once()
+            box, self.inbox_only = ("INBOX" if self.inbox_only else None), False
+            self.sync_once(box)
             self.wake.wait(INTERVAL)
             self.wake.clear()
 
-    def sync_once(self):
+    def sync_once(self, box=None):
         mb, a, slug = self.mb, self.a, self.a["slug"]
         started, done = time.time(), threading.Event()
         # first download until mbsync has completed a run of the INBOX (its state file)
@@ -760,7 +1017,7 @@ class Worker(threading.Thread):
                 tick += 1
         threading.Thread(target=progress, daemon=True).start()
         try:
-            r = mb.run_mbsync(a, worker=self)
+            r = mb.run_mbsync(a, box=box, worker=self)
         except Exception as e:
             r = subprocess.CompletedProcess([], 1, "", repr(e))
         done.set()
@@ -775,6 +1032,10 @@ class Worker(threading.Thread):
                             last=f"{n:,} messages here; this sync: {changes}")
             if first or (m and int(m.group(1)) > 0):
                 threading.Thread(target=mb.warm_index, args=(a,), daemon=True).start()
+            try:
+                mb.push.new_mail(a, first)
+            except Exception as e:
+                mb.log(slug, "new-mail notification:", repr(e))
         else:
             err = next((l for l in reversed(out) if l.strip()), f"mbsync exit {r.returncode}")
             mb.write_status(slug, ok=False, running=False, messages=n, last=err[:300])
@@ -794,6 +1055,18 @@ def near_uid(path):
 NEAR_UID = re.compile(r",U=(\d+)")
 
 
+def connect(a, timeout=60):
+    """An IMAP session at the account's provider, logged in."""
+    if a.get("imap_security", "ssl") == "ssl":
+        m = imaplib.IMAP4_SSL(a["imap_host"], int(a["imap_port"]), ssl_context=ssl.create_default_context(), timeout=timeout)
+    else:
+        m = imaplib.IMAP4(a["imap_host"], int(a["imap_port"]), timeout=timeout)
+        if a.get("imap_security") == "tls":
+            m.starttls(ssl_context=ssl.create_default_context())
+    m.login(a["user"], a["pass"])
+    return m
+
+
 class Remote:
     def __init__(self, a):
         self.a, self.m, self.last = a, None, 0
@@ -802,14 +1075,7 @@ class Remote:
         if self.m is not None and time.time() - self.last > 120:
             self.close()
         if self.m is None:
-            a = self.a
-            if a.get("imap_security", "ssl") == "ssl":
-                self.m = imaplib.IMAP4_SSL(a["imap_host"], int(a["imap_port"]), ssl_context=ssl.create_default_context())
-            else:
-                self.m = imaplib.IMAP4(a["imap_host"], int(a["imap_port"]))
-                if a.get("imap_security") == "tls":
-                    self.m.starttls(ssl_context=ssl.create_default_context())
-            self.m.login(a["user"], a["pass"])
+            self.m = connect(self.a)
         self.last = time.time()
         return self.m
 
@@ -819,6 +1085,108 @@ class Remote:
         except Exception:
             pass
         self.m = None
+
+
+class IdleWatcher(threading.Thread):
+    """IMAP IDLE on the provider's INBOX: new mail there wakes the account's worker
+    for an INBOX-only pull at once, instead of at the next MAILHUB_SYNC_INTERVAL.
+    One connection per account; a server without IDLE just leaves the polling."""
+
+    def __init__(self, worker):
+        super().__init__(daemon=True)
+        self.w = worker
+
+    def log(self, *a):
+        self.w.mb.log(self.w.a["slug"], "IDLE:", *a)
+
+    def run(self):
+        backoff, logged = 30, False
+        while not self.w.stop:
+            m = None
+            try:
+                m = connect(self.w.a)
+                if "IDLE" not in m.capabilities:
+                    typ, data = m.capability()
+                    if b"IDLE" not in b" ".join(data or []).upper().split():
+                        self.log("not offered by the server; polling every", INTERVAL, "s")
+                        return
+                typ, _ = m.select("INBOX", readonly=True)
+                if typ != "OK":
+                    raise RuntimeError("SELECT INBOX refused")
+                if logged:
+                    self.log("connected again")
+                backoff, logged = 30, False
+                self.idle(m)
+            except Exception as e:
+                if self.w.stop:
+                    break
+                if not logged:
+                    self.log("connection lost:", repr(e)[:200], f"(retrying, every {backoff} s at first)")
+                    logged = True
+                self.sleep(backoff)
+                backoff = min(backoff * 2, 600)
+            finally:
+                if m is not None:
+                    try:
+                        m.shutdown()
+                    except Exception:
+                        pass
+
+    def sleep(self, seconds):
+        end = time.time() + seconds
+        while not self.w.stop and time.time() < end:
+            time.sleep(min(5, end - time.time()))
+
+    def idle(self, m):
+        """IDLE until stopped, re-issued every IDLE_RENEW seconds. Reads the socket itself
+        (with select) rather than through imaplib's buffered file, which a timeout breaks."""
+        sock = m.sock
+        buf = b""
+
+        def lines(deadline):
+            nonlocal buf
+            while True:
+                while b"\r\n" in buf:
+                    line, buf = buf.split(b"\r\n", 1)
+                    yield line
+                if self.w.stop or time.time() >= deadline:
+                    return
+                pending = sock.pending() if hasattr(sock, "pending") else 0
+                if not pending:
+                    r, _, _ = select.select([sock], [], [], min(5, max(0.1, deadline - time.time())))
+                    if not r:
+                        continue
+                chunk = sock.recv(65536)
+                if not chunk:
+                    raise ConnectionError("closed by the server")
+                buf += chunk
+
+        while not self.w.stop:
+            tag = m._new_tag().decode()
+            sock.sendall(f"{tag} IDLE\r\n".encode())
+            started = False
+            for line in lines(time.time() + 30):
+                if line.startswith(b"+"):
+                    started = True
+                    break
+                if line.startswith(tag.encode()):
+                    raise RuntimeError("IDLE refused: " + line.decode("utf-8", "replace")[:100])
+            if not started:
+                raise TimeoutError("no answer to IDLE")
+            for line in lines(time.time() + IDLE_RENEW):
+                u = line.upper()
+                if u.startswith(b"* BYE"):
+                    raise ConnectionError(line.decode("utf-8", "replace")[:100])
+                if u.startswith(b"* ") and (u.endswith(b" EXISTS") or u.endswith(b" RECENT")):
+                    self.w.inbox_only = True
+                    self.w.wake.set()
+            sock.sendall(b"DONE\r\n")
+            for line in lines(time.time() + 30):
+                if line.startswith(tag.encode()):
+                    break
+            else:
+                if not self.w.stop:
+                    raise TimeoutError("no answer to DONE")
 
 
 # ------------------------------------------------------------------- main ---
@@ -850,6 +1218,14 @@ def main():
     if not MASTER_PASSWORD:
         log("MAILHUB_MASTER_PASSWORD is not set: only the owner's folders can be subscribed")
     migrate_single_user()
+    global VAPID
+    subject = PUSH_SUBJECT if PUSH_SUBJECT.startswith(("https://", "mailto:")) else ""
+    if not subject:
+        log("MAILHUB_PUSH_SUBJECT is not an https: or mailto: URL: push services may refuse the notifications")
+    try:
+        VAPID = webpush.Vapid.load_or_create(PUSH_DIR, subject or "mailto:postmaster@localhost")
+    except Exception as e:
+        log("no Web Push (VAPID key):", repr(e))
     mailboxes, prov = {}, Provisioner()
     while True:
         try:

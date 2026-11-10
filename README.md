@@ -30,6 +30,19 @@ file a user's page writes (`/accounts/<user>/<slug>.json`):
   A folder created through Dovecot (the webmail archiving into an account that had no Archive) is added to the views
   as soon as its CREATE is replayed.
 - **status**: `/state/<user>/status/<slug>.json` for the Mail accounts page, with the download progress.
+- **idle**: IMAP IDLE on each account's INBOX at the provider (one more connection per account): new mail wakes
+  that account's worker for an INBOX-only pull at once, instead of at the next interval. `MAILHUB_IDLE=0` turns
+  it off; a server without IDLE just keeps the polling.
+- **push**: Web Push (VAPID, RFC 8291 encryption, `webpush.py`) to the devices each user turned on in the
+  webmail's *Settings → Notifications* (`/accounts/<user>/.push.json`, written by mailhub-roundcube's
+  `mailhub_push`). After each pull, the account's INBOX messages above its high-water mark
+  (`/state/<user>/push-hwm.json`) still unread become a notification: sender and subject (or a count only, with
+  *show sender and subject* off), one summary for more than 3; muted accounts are skipped. The first download
+  and the first sync without a mark (an upgrade) only set the mark, so nothing old is announced. A test request
+  (`.push-test.json`) is answered in `/state/<user>/push-status.json`, which also holds each device's last
+  delivery or failure, `gone` after a 404/410. The server key is made once in `/state/.push/` (`vapid.json`,
+  0600; `vapid-public.txt` for the webmail). The payload is encrypted for the device: the push service (FCM,
+  Mozilla, Apple) only relays it.
 - **users**: the device logins (IMAPS, CalDAV/CardDAV). `/srv/vmail/.mailhub-passwd`, the passwd-file the
   store's Dovecot config checks, is rendered from the registry's `{SSHA512}` hashes plus the owner's
   `MAILHUB_PASSWORD`; each registry user gets a Baïkal account (user, principal, one calendar, one address
@@ -44,7 +57,8 @@ mail stays on disk.
 An account file removed stops its worker and deletes this server's copy (never the provider's).
 
 Settings: `MAILHUB_MASTER_PASSWORD` (Dovecot's master login), `MAILHUB_PASSWORD` (the owner's device
-login), `MAILHUB_IMAP_HOST` / `_PORT` (`mailhub-imap:31143`), `MAILHUB_SYNC_INTERVAL`, `MAILHUB_VMAIL_UID`
+login), `MAILHUB_IMAP_HOST` / `_PORT` (`mailhub-imap:31143`), `MAILHUB_SYNC_INTERVAL`, `MAILHUB_IDLE` (1),
+`MAILHUB_PUSH_SUBJECT` (the VAPID contact: the app's `https://` URL or a `mailto:`), `MAILHUB_VMAIL_UID`
 (1000), `MAILHUB_WEB_UID` (33, the webmail's user, for the moved account folder), `MAILHUB_BAIKAL_DB`.
 Mounts: `/srv/vmail`, `/accounts` (read-write for the one-time move), `/state`, `/users` (ro), `/baikal`. Runs as root to read the webmail's
 private account files; mbsync runs as the mailbox owner. Details in `mirror.py`'s docstring.
