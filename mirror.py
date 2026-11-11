@@ -16,6 +16,16 @@ account file a user's Mail accounts page writes (/accounts/<user>/<slug>.json):
            message is tied to its provider UID by mbsync's own pairing (",U=<n>" in the
            file name + the folder's .mbsyncstate); an action on a message mbsync has
            not paired yet waits in pending.jsonl, in order per folder.
+           A move between two folders of one account (Dovecot: added there, with its
+           Message-ID, then expunged here) is one UID MOVE at the provider, not APPEND
+           + EXPUNGE: the provider keeps its own message, and on Gmail, where a folder is
+           a label, a move to [Gmail]/Trash is a real delete instead of a second copy
+           while the first stays in All Mail. A message added to a Live/ folder waits up
+           to PAIR_WAIT s for that expunge, then is APPENDed as before. Folders touched
+           by the replay are pulled once the batch is done: a pull in the middle renamed
+           the messages of the same move still to be replayed (mbsync numbers what it
+           finds), so before 0.7.0 a move of several messages APPENDed only the first
+           and expunged them all at the provider.
   views    Merged/All inboxes, Unread, Flagged, Trash, Junk and Archive (Dovecot virtual
            folders) are rewritten from the accounts and folders that exist, leaving out the
            accounts set to stay out of them ("in_views": false in the account file),
@@ -91,6 +101,9 @@ VAPID = None  # webpush.Vapid, set in main()
 # a local user name: also a Dovecot home (/srv/vmail/<name>) and a Baïkal principal
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}")
 
+# a move inside one account: its expunge is paired with the added message when written within
+# PAIR_WINDOW s of it; a message added to a Live/ folder waits up to PAIR_WAIT s for that expunge
+PAIR_WINDOW, PAIR_WAIT = 60, 4
 SYSTEM_FLAGS = {"\\Seen", "\\Flagged", "\\Answered", "\\Draft", "\\Deleted"}
 MAILDIR_FLAG = {"D": "\\Draft", "F": "\\Flagged", "R": "\\Answered", "S": "\\Seen", "T": "\\Deleted"}
 # left out of the Unread and Flagged views (compared case-insensitively, last path part)
@@ -278,6 +291,10 @@ class Mailbox:
         # thousands of lines on a few big accounts) kept a core a quarter busy, while
         # a uidlist only changes when mail arrives, moves or is expunged.
         self.snap_seen = {}
+        # (slug, box, provider uid) -> Message-ID, to pair a move's two halves (provider_move)
+        self.mid_cache = {}
+        # (slug, folder) -> account: folders to pull after the current replay batch
+        self.repull = {}
         self.workers = {}
         self.seen, self.seen_views, self.nudge = None, None, 0
         self.push = Push(self)
@@ -527,9 +544,37 @@ class Mailbox:
         for sub in ("cur", "new"):
             d = f"{self.live}/{a['email']}/{box}/{sub}"
             for fn in os.listdir(d):
-                if fn == base or fn.startswith(base + ":"):
+                # or renamed by mbsync, which gives a near UID to a message it finds in its
+                # folder (base + ",U=<n>"): a pull of this folder ran since Dovecot wrote it
+                if fn == base or fn.startswith(base + ":") or fn.startswith(base + ",U="):
                     return os.path.join(d, fn)
         return None
+
+    def mirrored(self, a, box, path):
+        """Whether the local file is paired with a provider message in mbsync's state. A
+        ",U=<n>" in its name is not enough: mbsync also numbers a message only found here."""
+        n = near_uid(path)
+        if n is None:
+            return False
+        try:
+            with open(f"{self.live}/{a['email']}/{box}/.mbsyncstate") as f:
+                for line in f:
+                    p = line.split()
+                    if len(p) >= 2 and p[1] == str(n) and p[0].isdigit() and int(p[0]) > 0:
+                        return True
+        except FileNotFoundError:
+            pass
+        return False
+
+    def pull_later(self, a, box):
+        """Pull this folder once the current batch of replayed actions is done: a pull in
+        the middle of one renames the messages of the same move still to be replayed."""
+        self.repull[(a["slug"], box)] = a
+
+    def pull_now(self):
+        for (slug, box), a in list(self.repull.items()):
+            self.run_mbsync(a, box)
+        self.repull.clear()
 
     def snapshot(self, accs):
         for a in accs.values():
@@ -585,7 +630,7 @@ class Mailbox:
             path = self.local_file(a, box, uid)
             if path is None:
                 return "skip (file not found)"
-            if near_uid(path) is not None:
+            if self.mirrored(a, box, path):
                 return "skip (already a mirrored message)"
             info = os.path.basename(path).split(":2,", 1)
             flags = [MAILDIR_FLAG[c] for c in (info[1] if len(info) > 1 else "") if c in MAILDIR_FLAG]
@@ -594,7 +639,7 @@ class Mailbox:
             if typ != "OK":
                 raise RuntimeError(f"APPEND {typ} {d}")
             os.remove(path)  # the provider's copy comes back with the next pull, paired by mbsync
-            self.run_mbsync(a, box)
+            self.pull_later(a, box)
             return f"APPEND to {box} ({len(data)} bytes): {typ}"
 
         if kind == "MessageExpunge":
@@ -628,6 +673,111 @@ class Mailbox:
             return f"skip DELETE {box}: not empty at the provider"
         return f"skip ({kind})"
 
+    def upload_candidate(self, ev, accs):
+        """(account, folder, local file) when ev is a message added to a Live/ folder that
+        the replay would APPEND at the provider (not a mirrored message); else None."""
+        if ev.get("event") not in ("MessageAppend", "MessageNew") or not (ev.get("message_id") or "").strip():
+            return None
+        box_full = ev.get("mailbox", "")
+        a = next((x for x in accs.values() if box_full.startswith(prefix_of(x))), None)
+        if a is None:
+            return None
+        box = box_full[len(prefix_of(a)):]
+        try:
+            path = self.local_file(a, box, int(ev.get("uid", 0) or 0))
+        except FileNotFoundError:
+            return None
+        if path is None or self.mirrored(a, box, path):
+            return None
+        return a, box, path
+
+    def message_ids(self, m, a, box, fus):
+        """provider UID -> Message-ID for these UIDs of box (cached: a move of n messages
+        asks for each one once)."""
+        want = [fu for fu in fus if (a["slug"], box, fu) not in self.mid_cache]
+        if want:
+            if len(self.mid_cache) > 20000:
+                self.mid_cache.clear()
+            typ, _ = m.select(q(box))
+            if typ != "OK":
+                return {}
+            typ, d = m.uid("FETCH", ",".join(map(str, want)), "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+            if typ == "OK":
+                for part in d:
+                    if not isinstance(part, tuple):
+                        continue
+                    u = re.search(rb"UID (\d+)", part[0])
+                    h = re.sub(rb"\r?\n[ \t]+", b" ", part[1] or b"")
+                    v = re.search(rb"(?im)^message-id:\s*(.*?)\s*$", h)
+                    if u:
+                        self.mid_cache[(a["slug"], box, int(u.group(1)))] = v.group(1).decode("utf-8", "replace") if v else ""
+        return {fu: self.mid_cache.get((a["slug"], box, fu)) for fu in fus}
+
+    def provider_move(self, ev, later, accs, remotes):
+        """A move between two folders of one account, as Dovecot records it: the message
+        added to the destination (with its Message-ID), then expunged from the source, in
+        a later line. Replayed as one UID MOVE at the provider instead of APPEND + EXPUNGE,
+        so the provider keeps its own message: on Gmail a folder is a label, and APPEND
+        made a second message while the EXPUNGE only took the label off the first one (it
+        stayed in All Mail); a move to [Gmail]/Trash is now a real delete.
+        later: [(index, event)] of the lines after this one. Returns (result, index of the
+        paired expunge), or None: no pair found (or the provider refused), replayed as before."""
+        c = self.upload_candidate(ev, accs)
+        if c is None:
+            return None
+        a, dest, path = c
+        pre, mid = prefix_of(a), ev["message_id"].strip()
+        cands = []
+        for j, e in later:
+            src_full = e.get("mailbox", "")
+            if (e.get("event") != "MessageExpunge" or not src_full.startswith(pre) or src_full == ev.get("mailbox")
+                    or abs((e.get("at") or 0) - (ev.get("at") or 0)) > PAIR_WINDOW):
+                continue
+            src = src_full[len(pre):]
+            n = self.snap.get((a["email"], src, int(e.get("uid", 0) or 0)))
+            if n is None:
+                continue
+            try:
+                cands.append((j, src, self.far_of_near(a, src, n), e))
+            except Wait:
+                continue
+        if not cands:
+            return None
+        r = remotes.setdefault(a["slug"], Remote(a))
+        r.a = a
+        for attempt in (1, 2):  # a kept connection the provider has dropped: once more, anew
+            try:
+                return self._provider_move(r, a, cands, mid, dest, path)
+            except Exception as e:
+                r.close()
+                if attempt == 2:
+                    self.log("replay: provider MOVE failed, replayed as APPEND + EXPUNGE:", repr(e))
+        return None
+
+    def _provider_move(self, r, a, cands, mid, dest, path):
+        """provider_move's work on one connection: (result, index) or None."""
+        m = r.get()
+        for j, src, fu, e in cands:
+            if self.message_ids(m, a, src, [x[2] for x in cands if x[1] == src]).get(fu) != mid:
+                continue
+            m.select(q(src))
+            if "MOVE" in m.capabilities:
+                typ, d = m.uid("MOVE", str(fu), q(dest))
+            else:  # UIDPLUS, as the plain expunge assumes
+                typ, d = m.uid("COPY", str(fu), q(dest))
+                if typ == "OK":
+                    m.uid("STORE", str(fu), "+FLAGS.SILENT", "(\\Deleted)")
+                    m.uid("EXPUNGE", str(fu))
+            if typ != "OK":
+                self.log("replay: provider MOVE refused, replayed as APPEND + EXPUNGE:", typ, d)
+                return None
+            self.snap.pop((a["email"], src, int(e.get("uid", 0) or 0)), None)
+            self.mid_cache.pop((a["slug"], src, fu), None)
+            os.remove(path)  # the provider's copy comes back with the next pull, paired by mbsync
+            self.pull_later(a, dest)
+            return f"MOVE provider UID {fu} {src} -> {dest}: {typ}", j
+        return None
+
     def replay_loop(self):
         remotes, pending, last_retry = {}, [], 0
         if os.path.exists(self.pending_file):
@@ -652,15 +802,27 @@ class Mailbox:
                 if os.path.exists(self.queue) and os.path.getsize(self.queue) < off:
                     off = 0  # queue file recreated
                 if os.path.exists(self.queue) and os.path.getsize(self.queue) > off:
-                    with open(self.queue) as f:
+                    with open(self.queue, "rb") as f:
                         f.seek(off)
-                        for line in f:
-                            if not line.endswith("\n"):
-                                break
-                            off += len(line.encode())
-                            box = json.loads(line).get("mailbox", "")
-                            if any(json.loads(p).get("mailbox") == box for p in pending):
-                                pending.append(line)  # keep this folder's actions in order
+                        # complete lines only; the last part is an unfinished line, or empty
+                        batch = [b.decode() + "\n" for b in f.read().split(b"\n")[:-1]]
+                    evs = [json.loads(line) for line in batch]
+                    paired = set()  # expunges already replayed by a provider MOVE
+                    for i, line in enumerate(batch):
+                        ev = evs[i]
+                        if i in paired:
+                            pass
+                        elif any(json.loads(p).get("mailbox") == ev.get("mailbox", "") for p in pending):
+                            pending.append(line)  # keep this folder's actions in order
+                        else:
+                            later = [(j, evs[j]) for j in range(i + 1, len(batch)) if j not in paired]
+                            moved = self.provider_move(ev, later, accs, remotes)
+                            if moved:
+                                paired.add(moved[1])
+                                self.log("replay", ev.get("event"), ev.get("mailbox"), ev.get("uid"), "->", moved[0])
+                            elif (time.time() - (ev.get("at") or 0) < PAIR_WAIT
+                                  and self.upload_candidate(ev, accs) is not None):
+                                break  # may be half of a move whose expunge is not written yet: next round
                             else:
                                 try:
                                     try_one(line, accs)
@@ -672,7 +834,8 @@ class Mailbox:
                                         x.close()
                                     self.log("replay FAILED", line.strip(), "->", repr(e))
                                     open(self.failed, "a").write(line)
-                            open(self.offset, "w").write(str(off))
+                        off += len(line.encode())
+                        open(self.offset, "w").write(str(off))
                 if pending and time.time() - last_retry > 30:
                     kept, blocked = [], set()
                     for line in pending:
@@ -691,6 +854,7 @@ class Mailbox:
                     pending, last_retry = kept, time.time()
                 with open(self.pending_file, "w") as pf:
                     pf.writelines(pending)
+                self.pull_now()
                 for x in remotes.values():
                     if x.m is not None and time.time() - x.last > 120:
                         x.close()

@@ -20,7 +20,15 @@ file a user's page writes (`/accounts/<user>/<slug>.json`):
   accounts change or the page touches `/accounts/.sync-now`.
 - **replay**: the IMAP actions done on `Live/` folders (recorded by the store's Dovecot Lua hook in
   `live-queue/events.jsonl`) become the same command at that provider: flags, append, expunge of that one UID,
-  create / rename, delete only if empty there. Nothing is inferred.
+  create / rename, delete only if empty there. Nothing is inferred. A move between two folders of one account
+  (Dovecot records the message added there, with its Message-ID, then expunged here) is one `UID MOVE` at the
+  provider (`COPY` + expunge without MOVE), so the provider keeps its own message: on Gmail, where a folder
+  is a label, archiving changes the label and a move to `[Gmail]/Trash` is a real delete, where `APPEND` +
+  `EXPUNGE` made a second copy and left the first in All Mail. A message added to a `Live/` folder waits a few
+  seconds for that expunge, then is appended as before. Folders the replay touched are pulled once per batch.
+  Before 0.7.0 a pull ran after each appended message and renamed the other messages of the same move, so a
+  move of several messages into an account folder appended only the first and expunged them all at the
+  provider: the others stayed only in this server's copy, as files `.mbsyncstate` does not pair.
 - **views**: `Merged/All inboxes`, `Unread`, `Flagged`, `Trash`, `Junk` and `Archive` (Dovecot virtual folders) rewritten from the
   accounts and folders that exist, minus accounts with `"in_views": false`; new `Live/` and `Merged/` folders
   subscribed. (Named `Virtual/` before 0.4.1: those subscriptions are dropped.) `All inboxes`, `Trash` and `Junk` also cover the local
