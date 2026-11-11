@@ -68,8 +68,42 @@ Settings: `MAILHUB_MASTER_PASSWORD` (Dovecot's master login), `MAILHUB_PASSWORD`
 login), `MAILHUB_IMAP_HOST` / `_PORT` (`mailhub-imap:31143`), `MAILHUB_SYNC_INTERVAL`, `MAILHUB_IDLE` (1),
 `MAILHUB_PUSH_SUBJECT` (the VAPID contact: the app's `https://` URL or a `mailto:`), `MAILHUB_VMAIL_UID`
 (1000), `MAILHUB_WEB_UID` (33, the webmail's user, for the moved account folder), `MAILHUB_BAIKAL_DB`.
+The device logins are also written to `/state/.submit/passwd` for mailhub-submit (below).
 Mounts: `/srv/vmail`, `/accounts` (read-write for the one-time move), `/state`, `/users` (ro), `/baikal`. Runs as root to read the webmail's
 private account files; mbsync runs as the mailbox owner. Details in `mirror.py`'s docstring.
+
+## mailhub-submit (`submit.py`)
+
+The same image, run as a second service (`entrypoint: [/sbin/tini, --, python3, -u, /usr/local/bin/submit.py]`):
+one SMTP login for mail apps. A phone or desktop client sets up MailHub as one account, IMAPS 993 and SMTP
+465 (or 587) on the same host with the same device login, and every address the user connected in *Mail
+accounts* sends from it, each through its own provider with that account's login.
+
+- **Ports**: 31465 implicit TLS, 31587 STARTTLS (required before AUTH); the IMAPS certificate in `/tls`.
+  AUTH PLAIN / LOGIN only.
+- **Login**: the device login, checked against `/submit/passwd`, the copy of Dovecot's passwd-file this mirror
+  writes in `/state/.submit/`. Dovecot is never asked, so its master login cannot be reached from this port.
+  A PLAIN authorization id other than the user is refused, and so is a name that isn't a local user. Failed
+  logins back off per client IP (5 in 10 min, then 1, 2, 4… up to 15 min).
+- **Sender**: `MAIL FROM` must be one of the user's account addresses, and the `From:` header that same single
+  address, else `550 5.7.1`. The provider is chosen from that address only. An account file without
+  `smtp_host` (written before mailhub-roundcube 0.8.0) is refused with "open Mail accounts and save it again".
+- **Relay**: synchronous, nothing queued. The provider is connected at `MAIL FROM`, each `RCPT` gets its
+  answer, and its reply to `DATA` is the client's (2xx / 5xx kept, anything else 4xx), the account named in
+  the text. The provider transaction has 90 s at most. Nothing is saved: clients keep their sent copy in
+  the local Sent, as the webmail does.
+- **Limits**: `MAILHUB_SUBMIT_DAILY_RCPT` recipients per user per 24 h (500), `MAILHUB_SUBMIT_MAX_SIZE` (25 MB).
+- **Log**: one line per message (user, account, recipients, size, provider code); never a subject, body or
+  password.
+- Settings: `APP_TLS_HOST` (the name in the greeting), `MAILHUB_SUBMIT_BUDGET` (90),
+  `MAILHUB_SUBMIT_CONNECT_TIMEOUT` (20). Mounts, read-only: `/accounts`, `/submit`, `/tls`.
+
+Tests: `tests/test_submit.py` against an in-process fake provider, run in the image (CI does):
+
+```sh
+docker build -t mailhub-mirror . && \
+docker run --rm -v "$PWD/tests:/tests:ro" --entrypoint python3 mailhub-mirror -m unittest discover -s /tests -v
+```
 
 ## Building and releasing
 

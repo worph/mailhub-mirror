@@ -54,7 +54,8 @@ account file a user's Mail accounts page writes (/accounts/<user>/<slug>.json):
 
   users    The device logins (IMAPS, CalDAV/CardDAV): /srv/vmail/.mailhub-passwd, the
            passwd-file Dovecot checks, rendered from the registry's hashes plus the
-           owner's MAILHUB_PASSWORD; and each registry user's Baïkal account (user,
+           owner's MAILHUB_PASSWORD (also copied to /state/.submit/passwd for mailhub-submit,
+           submit.py, which checks the SMTP logins against it); and each registry user's Baïkal account (user,
            principal, one calendar, one address book) with its digest. The owner's
            Baïkal account is the store's baikal-init step's. /state/<user>/device-applied
            holds the digest in effect, for the webmail's own calendar connection.
@@ -94,6 +95,9 @@ STATE = "/state"
 USERS = "/users"
 VMAIL_ROOT = "/srv/vmail"
 PASSWD = f"{VMAIL_ROOT}/.mailhub-passwd"
+# the same device logins for mailhub-submit (submit.py), which mounts only this folder
+SUBMIT_DIR = f"{STATE}/.submit"
+SUBMIT_PASSWD = f"{SUBMIT_DIR}/passwd"
 BAIKAL_DB = os.environ.get("MAILHUB_BAIKAL_DB", "/baikal/db/db.sqlite")
 BAIKAL_REALM = "BaikalDAV"
 PUSH_DIR = f"{STATE}/.push"  # vapid.json (private, 0600) + vapid-public.txt (the webmail reads it)
@@ -219,7 +223,7 @@ class Provisioner:
 
     def passwd(self, users):
         sig = (OWNER_PASSWORD, tuple(sorted((n, u.get("device_hash", "")) for n, u in users.items() if n != OWNER)))
-        if sig == self.seen_passwd and os.path.exists(PASSWD):
+        if sig == self.seen_passwd and os.path.exists(PASSWD) and os.path.exists(SUBMIT_PASSWD):
             return
         if self.owner_hash is None and OWNER_PASSWORD:
             self.owner_hash = ssha512(OWNER_PASSWORD)
@@ -228,7 +232,11 @@ class Provisioner:
             h = u.get("device_hash", "")
             if n != OWNER and re.fullmatch(r"\{SSHA512\}[A-Za-z0-9+/=]+", h):
                 lines.append(f"{n}:{h}")
-        atomic_write(PASSWD, "".join(l + "\n" for l in lines), 0o600, VMAIL)
+        text = "".join(l + "\n" for l in lines)
+        atomic_write(PASSWD, text, 0o600, VMAIL)
+        os.makedirs(SUBMIT_DIR, mode=0o700, exist_ok=True)
+        os.chmod(SUBMIT_DIR, 0o700)
+        atomic_write(SUBMIT_PASSWD, text, 0o600, 0)
         self.seen_passwd = sig
         log("device logins:", ", ".join(l.split(":", 1)[0] for l in lines) or "none")
 

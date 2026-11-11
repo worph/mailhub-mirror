@@ -21,6 +21,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # submit.py's tests (tests/test_submit.py) in the image they ship in, before the multi-arch build
+      - name: Test
+        run: |
+          docker build -t mailhub-mirror:test .
+          docker run --rm -v "$PWD/tests:/tests:ro" --entrypoint python3 mailhub-mirror:test \
+            -m unittest discover -s /tests -v
+
       - uses: docker/setup-qemu-action@v3
 
       - uses: docker/setup-buildx-action@v3
