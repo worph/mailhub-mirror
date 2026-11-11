@@ -212,6 +212,25 @@ class SubmitTest(unittest.TestCase):
         with self.assertRaises(smtplib.SMTPAuthenticationError):
             self.tls().login("admin", ADMIN_PW)
 
+    def test_one_wrong_password_counts_once(self):
+        # smtplib tries PLAIN, then LOGIN: two refusals, one failure for the backoff
+        with self.assertRaises(smtplib.SMTPAuthenticationError):
+            self.tls().login("admin", "nope")
+        self.assertEqual(len(self.relay.backoff.fails["127.0.0.1"]), 1)
+
+    def test_connection_closed_after_failed_logins(self):
+        s = self.tls()
+        s.ehlo()
+        for _ in range(submit.CONN_FAILS):
+            self.assertEqual(self.plain(s, "", "admin", "nope")[0], 535)
+        # the relay sent 421 after the second refusal and hung up: no third guess here
+        try:
+            code = s.noop()[0]
+        except (smtplib.SMTPServerDisconnected, ConnectionError, ssl.SSLError):
+            code = 421
+        self.assertEqual(code, 421)
+        s.close()
+
     def test_backoff_grows(self):
         b, t = submit.Backoff(), 1000.0
         for _ in range(submit.FAIL_MAX):

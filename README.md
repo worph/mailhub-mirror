@@ -88,7 +88,9 @@ accounts* sends from it, each through its own provider with that account's login
 - **Login**: the device login, checked against `/submit/passwd`, the copy of Dovecot's passwd-file this mirror
   writes in `/state/.submit/`. Dovecot is never asked, so its master login cannot be reached from this port.
   A PLAIN authorization id other than the user is refused, and so is a name that isn't a local user. Failed
-  logins back off per client IP (5 in 10 min, then 1, 2, 4… up to 15 min).
+  logins back off per client IP (5 failed connections in 10 min, then 1, 2, 4… up to 15 min); a client's
+  retry with its next mechanism is the same failure, and a connection is closed after 2 refused logins.
+  aiosmtpd's own warning lines are silenced (its `mail.log` logger at ERROR).
 - **Sender**: `MAIL FROM` must be one of the user's account addresses, and the `From:` header that same single
   address, else `550 5.7.1`. The provider is chosen from that address only. An account file without
   `smtp_host` (written before mailhub-roundcube 0.8.0) is refused with "open Mail accounts and save it again".

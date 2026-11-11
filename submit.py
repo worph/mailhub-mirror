@@ -33,13 +33,15 @@ Runs as root to read the webmail's private account files (read-only mounts).
 """
 import asyncio, base64, collections, email.parser, email.policy, email.utils, hashlib, hmac, json, os, re, smtplib, socket, ssl, threading, time
 
-import warnings
+import logging, warnings
 
 from aiosmtpd.smtp import SMTP, AuthResult, LoginPassword, MISSING
 
-# aiosmtpd's own noise: it sets its deprecated Session.login_data itself, and it can't tell that a
-# connection on 465 is TLS from the first byte (it only counts STARTTLS), so it warns on every one
-warnings.filterwarnings("ignore", message="Session.login_data is deprecated")
+# aiosmtpd's own noise, on every 465 connection and every login: it sets its deprecated
+# Session.login_data itself, and it can't tell that 465 is TLS from the first byte (it only counts
+# STARTTLS). Both are its logger's warnings ("mail.log"), the second also a Python warning. Our own
+# lines go through log() and are not affected.
+logging.getLogger("mail.log").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", message="Requiring AUTH while not requiring TLS")
 
 ACCOUNTS = os.environ.get("MAILHUB_ACCOUNTS_DIR", "/accounts")
@@ -53,8 +55,11 @@ MAX_SIZE = int(os.environ.get("MAILHUB_SUBMIT_MAX_SIZE", str(25 * 1024 * 1024)))
 DAILY_RCPT = int(os.environ.get("MAILHUB_SUBMIT_DAILY_RCPT", "500"))
 CONNECT_TIMEOUT = float(os.environ.get("MAILHUB_SUBMIT_CONNECT_TIMEOUT", "20"))
 UPSTREAM_BUDGET = float(os.environ.get("MAILHUB_SUBMIT_BUDGET", "90"))
-# failed logins per client IP: FAIL_MAX within FAIL_WINDOW s -> refused for 2^n min (n = lockouts), capped
-FAIL_MAX, FAIL_WINDOW, LOCK_CAP = 5, 600, 900
+# failed logins per client IP, counted once per connection: FAIL_MAX within FAIL_WINDOW s -> refused
+# for 2^n min (n = lockouts), capped. A client retries with its next mechanism after a refusal
+# (smtplib: PLAIN then LOGIN), so one wrong password is one failure, not two; a connection is
+# closed after CONN_FAILS refused logins, so it can't be used for guessing either.
+FAIL_MAX, FAIL_WINDOW, LOCK_CAP, CONN_FAILS = 5, 600, 900, 2
 
 # a local user name (mirror.py's NAME_RE): also a Dovecot home and a Baïkal principal
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}")
@@ -318,10 +323,16 @@ class Submit(SMTP):
         if authzid and authzid != login:
             # acting as another user (Dovecot's master-login form): never, whatever the password
             ip = self.session.peer[0] if self.session.peer else "?"
-            self.event_handler.backoff.failed(ip)
+            self.event_handler.refused(self.session, ip)
             log(f"auth refused ip={ip} user={login.decode('utf-8', 'replace')!r}: authorization id given")
             return AuthResult(success=False, handled=False, message="535 5.7.8 Authentication credentials invalid")
         return self._authenticate("PLAIN", LoginPassword(login, password))
+
+    async def smtp_AUTH(self, arg):
+        await super().smtp_AUTH(arg)
+        if getattr(self.session, "auth_fails", 0) >= CONN_FAILS and self.transport is not None:
+            await self.push("421 4.7.0 too many failed logins, closing")
+            self.transport.close()
 
     def connection_lost(self, error):
         up = getattr(self.session, "upstream", None) if self.session else None
@@ -355,9 +366,15 @@ class Relay:
         if NAME_RE.fullmatch(name) and self.passwords.check(name, auth_data.password):
             self.backoff.succeeded(ip)
             return AuthResult(success=True, auth_data=auth_data)
-        self.backoff.failed(ip)
+        self.refused(session, ip)
         log(f"auth failed ip={ip} user={name!r}")
         return fail
+
+    def refused(self, session, ip):
+        """A refused login: counted against the IP once per connection."""
+        session.auth_fails = getattr(session, "auth_fails", 0) + 1
+        if session.auth_fails == 1:
+            self.backoff.failed(ip)
 
     # --- helpers
 
