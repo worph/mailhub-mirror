@@ -730,15 +730,16 @@ class Mailbox:
             n = self.snap.get((a["email"], src, int(e.get("uid", 0) or 0)))
             if n is None:
                 # moved before the snapshot saw it (within a replay round of Dovecot numbering
-                # it): the copy is a hard link that kept the source's file name, so its
-                # ",U=<n>" is the source pair. The Message-ID check below confirms it.
+                # it): a hard-linked copy kept the source's file name and its ",U=<n>"; else
+                # the source message is looked up at the provider by Message-ID (_provider_move)
                 n = near_uid(path)
-            if n is None:
-                continue
-            try:
-                cands.append((j, src, self.far_of_near(a, src, n), e))
-            except Wait:
-                continue
+            fu = None
+            if n is not None:
+                try:
+                    fu = self.far_of_near(a, src, n)
+                except Wait:
+                    pass
+            cands.append((j, src, fu, e))
         if not cands:
             return None
         r = remotes.setdefault(a["slug"], Remote(a))
@@ -756,7 +757,14 @@ class Mailbox:
         """provider_move's work on one connection: (result, index) or None."""
         m = r.get()
         for j, src, fu, e in cands:
-            if self.message_ids(m, a, src, [x[2] for x in cands if x[1] == src]).get(fu) != mid:
+            if fu is None:
+                if m.select(q(src))[0] != "OK":
+                    continue
+                found = m.uid("SEARCH", "HEADER", "Message-ID", mid)[1][0].split()
+                if len(found) != 1:
+                    continue  # not there, or ambiguous: replayed as before
+                fu = int(found[0])
+            elif self.message_ids(m, a, src, [x[2] for x in cands if x[1] == src and x[2]]).get(fu) != mid:
                 continue
             m.select(q(src))
             if "MOVE" in m.capabilities:

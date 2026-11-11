@@ -33,7 +33,9 @@ file a user's page writes (`/accounts/<user>/<slug>.json`):
   message is never taken for a mirrored one by its name (0.8.0 did when that number was paired in the
   destination too: the copy was skipped and the source still expunged). A provider connection dropped while
   idle is reopened once before a replayed action counts as failed. A message moved within a replay round of
-  arriving (not yet in the replay's snapshot) is still paired: its copy's file name carries the source pair.
+  arriving (not yet in the replay's snapshot) is still paired: its copy's file name carries the source pair, or (the store's
+  Dovecot copies without hard links since MailHub 0.8.4) it is found at the provider by Message-ID, when exactly one
+  message there has it.
 - **views**: `Merged/All inboxes`, `Unread`, `Flagged`, `Trash`, `Junk` and `Archive` (Dovecot virtual folders) rewritten from the
   accounts and folders that exist, minus accounts with `"in_views": false`; new `Live/` and `Merged/` folders
   subscribed. (Named `Virtual/` before 0.4.1: those subscriptions are dropped.) `All inboxes`, `Trash` and `Junk` also cover the local
