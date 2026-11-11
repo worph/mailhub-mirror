@@ -29,6 +29,10 @@ file a user's page writes (`/accounts/<user>/<slug>.json`):
   Before 0.7.0 a pull ran after each appended message and renamed the other messages of the same move, so a
   move of several messages into an account folder appended only the first and expunged them all at the
   provider: the others stayed only in this server's copy, as files `.mbsyncstate` does not pair.
+  Dovecot copies by hard link and keeps the file name, the source folder's `,U=<n>` included, so a copied
+  message is never taken for a mirrored one by its name (0.8.0 did when that number was paired in the
+  destination too: the copy was skipped and the source still expunged). A provider connection dropped while
+  idle is reopened once before a replayed action counts as failed.
 - **views**: `Merged/All inboxes`, `Unread`, `Flagged`, `Trash`, `Junk` and `Archive` (Dovecot virtual folders) rewritten from the
   accounts and folders that exist, minus accounts with `"in_views": false`; new `Live/` and `Merged/` folders
   subscribed. (Named `Virtual/` before 0.4.1: those subscriptions are dropped.) `All inboxes`, `Trash` and `Junk` also cover the local

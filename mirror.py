@@ -558,22 +558,6 @@ class Mailbox:
                     return os.path.join(d, fn)
         return None
 
-    def mirrored(self, a, box, path):
-        """Whether the local file is paired with a provider message in mbsync's state. A
-        ",U=<n>" in its name is not enough: mbsync also numbers a message only found here."""
-        n = near_uid(path)
-        if n is None:
-            return False
-        try:
-            with open(f"{self.live}/{a['email']}/{box}/.mbsyncstate") as f:
-                for line in f:
-                    p = line.split()
-                    if len(p) >= 2 and p[1] == str(n) and p[0].isdigit() and int(p[0]) > 0:
-                        return True
-        except FileNotFoundError:
-            pass
-        return False
-
     def pull_later(self, a, box):
         """Pull this folder once the current batch of replayed actions is done: a pull in
         the middle of one renames the messages of the same move still to be replayed."""
@@ -638,8 +622,9 @@ class Mailbox:
             path = self.local_file(a, box, uid)
             if path is None:
                 return "skip (file not found)"
-            if self.mirrored(a, box, path):
-                return "skip (already a mirrored message)"
+            # No "already mirrored" test on the file name: Dovecot copies by hard link and keeps
+            # the name, ",U=<n>" of the source folder included, which in this folder can be
+            # another message's pair. An event is an IMAP action; mbsync's writes make none.
             info = os.path.basename(path).split(":2,", 1)
             flags = [MAILDIR_FLAG[c] for c in (info[1] if len(info) > 1 else "") if c in MAILDIR_FLAG]
             data = open(path, "rb").read()
@@ -695,7 +680,7 @@ class Mailbox:
             path = self.local_file(a, box, int(ev.get("uid", 0) or 0))
         except FileNotFoundError:
             return None
-        if path is None or self.mirrored(a, box, path):
+        if path is None:
             return None
         return a, box, path
 
@@ -793,7 +778,14 @@ class Mailbox:
 
         def try_one(line, accs):
             ev = json.loads(line)
-            res = self.apply(ev, accs, remotes)
+            try:
+                res = self.apply(ev, accs, remotes)
+            except (imaplib.IMAP4.abort, OSError) as e:
+                # a kept connection the provider has dropped (idle timeout): once more, anew
+                for x in remotes.values():
+                    x.close()
+                self.log("replay: provider connection lost, retrying:", repr(e))
+                res = self.apply(ev, accs, remotes)
             if res is not None:
                 self.log("replay", ev.get("event"), ev.get("mailbox"), ev.get("uid"), "->", res)
 
