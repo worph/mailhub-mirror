@@ -32,7 +32,8 @@ file a user's page writes (`/accounts/<user>/<slug>.json`):
   Dovecot copies by hard link and keeps the file name, the source folder's `,U=<n>` included, so a copied
   message is never taken for a mirrored one by its name (0.8.0 did when that number was paired in the
   destination too: the copy was skipped and the source still expunged). A provider connection dropped while
-  idle is reopened once before a replayed action counts as failed.
+  idle is reopened once before a replayed action counts as failed. A message moved within a replay round of
+  arriving (not yet in the replay's snapshot) is still paired: its copy's file name carries the source pair.
 - **views**: `Merged/All inboxes`, `Unread`, `Flagged`, `Trash`, `Junk` and `Archive` (Dovecot virtual folders) rewritten from the
   accounts and folders that exist, minus accounts with `"in_views": false`; new `Live/` and `Merged/` folders
   subscribed. (Named `Virtual/` before 0.4.1: those subscriptions are dropped.) `All inboxes`, `Trash` and `Junk` also cover the local

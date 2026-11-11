@@ -729,6 +729,11 @@ class Mailbox:
             src = src_full[len(pre):]
             n = self.snap.get((a["email"], src, int(e.get("uid", 0) or 0)))
             if n is None:
+                # moved before the snapshot saw it (within a replay round of Dovecot numbering
+                # it): the copy is a hard link that kept the source's file name, so its
+                # ",U=<n>" is the source pair. The Message-ID check below confirms it.
+                n = near_uid(path)
+            if n is None:
                 continue
             try:
                 cands.append((j, src, self.far_of_near(a, src, n), e))
